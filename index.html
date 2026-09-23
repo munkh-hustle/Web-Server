@@ -758,89 +758,96 @@ function parseHtmlListing(html){
 /* ------------------------------------------------------------------
    FETCH LISTING (Caddy file_server browse JSON, with HTML fallback)
    ------------------------------------------------------------------ */
-// Try to list `candidate`; returns entry array or null (never throws).
-async function tryList(candidate){
-  try{
-    const r = await fetch(candidate, { headers:{ "Accept":"application/json" }, cache:"no-store" });
-    if(!r.ok) return null;
-    const ct = (r.headers.get("Content-Type")||"").toLowerCase();
-    const t  = await r.text();
-    let a = [];
-    if(ct.includes("json")){
-      try{ const d = JSON.parse(t); a = Array.isArray(d)?d:(d.entries||d.items||[]); }catch(e){}
-    } else if(ct.includes("html") || t.trimStart().startsWith("<")){
-      if(/D201|id="main"|id="intro"/.test(t)) return null; // SPA fallback page → not a listing
-      try{ a = parseHtmlListing(t); }catch(e){ return null; }
-    }
-    return a.length ? a : null;
-  }catch(e){ return null; }
+const SELF_MARKERS = ["MANAS", 'id="intro"', 'aria-label="D201"', 'class="folder stag"', "This chamber of the vault"];
+function isSelfPage(text){
+  const head = text.slice(0, 6000);
+  return SELF_MARKERS.some(m => head.includes(m));
 }
 
-async function fetchListing(segments){
-  let url = segments.length ? buildURL(segments) + "/" : BASE;
-  let res = await fetch(url, { headers:{ "Accept":"application/json" }, cache:"no-store" });
-
-  // If the current BASE is wrong (404, or SPA/HTML returned), auto-discover:
-  // walk BASE up one folder at a time and re-try the requested path under it.
-  if(!res.ok || !(res.headers.get("Content-Type")||"").toLowerCase().includes("json")){
-    const text0 = res.ok ? await res.text() : "";
-    const looksLikeSpaOrErr = !res.ok || /D201|id="main"|id="intro"/.test(text0) || (!text0.trim().startsWith("[") && text0.trim().startsWith("<"));
-    if(looksLikeSpaOrErr){
-      const parts = BASE.replace(/^\/files\/?/,"").split("/").filter(Boolean);
-      outer:
-      while(parts.length){
-        parts.pop();
-        const candidate = "/files/" + (parts.length ? parts.map(encodeURIComponent).join("/")+"/" : "");
-        const testUrl = segments.length ? candidate + segments.map(encodeURIComponent).join("/")+"/" : candidate;
-        try{
-          const r2 = await fetch(testUrl, { headers:{ "Accept":"application/json" }, cache:"no-store" });
-          if(!r2.ok) continue;
-          const ct2 = (r2.headers.get("Content-Type")||"").toLowerCase();
-          const t2 = await r2.text();
-          let a2 = null;
-          if(ct2.includes("json")){
-            try{ const d2 = JSON.parse(t2); a2 = Array.isArray(d2)?d2:(d2.entries||d2.items||[]); }catch(e){}
-          } else if(/D201|id="main"|id="intro"/.test(t2)){
-            a2 = null;
-          } else {
-            try{ a2 = parseHtmlListing(t2); }catch(e){ a2 = null; }
-          }
-          if(a2 && a2.length){ BASE = candidate; res = r2; url = testUrl; break outer; }
-        }catch(e){ /* keep trying */ }
-      }
-      if(BASE === "/files/" && !segments.length && !res.ok){
-        // last resort: root of the file server
-        const a2 = await tryList("/files/");
-        if(a2){ BASE = "/files/"; res = await fetch("/files/", { headers:{ "Accept":"application/json" }, cache:"no-store" }); }
-      }
-    }
+// Fetch a directory URL and normalise the response into entries.
+// Returns { ok:true, entries:[...] } or { ok:false, reason, status }.
+// Never throws for HTTP-level problems; tolerates JSON *or* HTML listings.
+async function getEntries(url){
+  let res;
+  try{
+    res = await fetch(url, { headers:{ "Accept":"application/json, text/html;q=0.8, */*;q=0.5" }, cache:"no-store" });
+  }catch(e){
+    return { ok:false, reason:"network" };
   }
-
-  if(!res.ok) throw new Error("HTTP "+res.status+" — folder not reachable");
+  if(!res.ok) return { ok:false, reason:"http", status:res.status };
 
   const ctype = (res.headers.get("Content-Type") || "").toLowerCase();
-  const text  = res.bodyUsed ? "" : await res.text();
+  let text;
+  try{ text = await res.text(); }catch(e){ return { ok:false, reason:"network" }; }
+
   let arr = [];
+  const looksHtml = ctype.includes("html") || text.trimStart().startsWith("<");
 
   if(ctype.includes("json")){
     try{
       const data = JSON.parse(text);
       arr = Array.isArray(data) ? data : (data.entries || data.items || []);
-    }catch(e){ /* fall through to HTML parsing */ }
-  }
-  if(!arr.length && (ctype.includes("html") || text.trimStart().startsWith("<"))){
-    // Server answered with an HTML browse page — parse it instead of failing on JSON
-    // (this is what previously produced: Unexpected token '<', "<!DOCTYPE "... is not valid JSON)
-    arr = parseHtmlListing(text);
+    }catch(e){ /* fall through to HTML path below */ }
   }
 
-  return arr.map(e=>({
+  if(!arr.length && looksHtml){
+    if(isSelfPage(text)){
+      // The SPA itself was echoed back → this URL isn't really served by the
+      // file server (wrong prefix / try_files fallback). Treat as unreachable.
+      return { ok:false, reason:"selfpage", status:res.status };
+    }
+    // A genuine Caddy/nginx browse page. If it contains zero links, the folder
+    // is truly empty — that's a successful listing with no entries, NOT an error.
+    try{ arr = parseHtmlListing(text); }catch(e){ arr = []; }
+  } else if(!arr.length && !looksHtml && !ctype.includes("json")){
+    return { ok:false, reason:"unknown", status:res.status };
+  }
+  // anything left over (JSON parsed to [], or empty-body) is simply an empty folder
+
+  const entries = arr.map(e=>({
     name: String(e.name || ""),
     isDir: !!(e.is_dir || e.isDir || e.type === "directory" || (e.name && e.name.endsWith("/"))),
     size: e.size != null ? e.size : null,
     mod:  e.mod_time || e.modTime || e.mtime || null
-  })).map(e=>({ ...e, name: e.name.replace(/\/$/,"").split("/").filter(Boolean).pop() || e.name }))
+  })).map(e=>({ ...e, name: decodeURIComponent(e.name.replace(/\/$/,"").split("/").filter(Boolean).pop() || e.name) }))
     .filter(e=> e.name && e.name !== "." && e.name !== "..");
+
+  return { ok:true, entries };
+}
+
+async function fetchListing(segments){
+  let url = segments.length ? buildURL(segments) + "/" : BASE;
+  let r = await getEntries(url);
+
+  // If the configured ROOT is wrong (404 / app-page echoed back / unreachable),
+  // auto-discover: walk up one folder at a time from ROOT and re-try the same
+  // relative path under each shallower base. First success updates BASE.
+  if(!r.ok && (r.reason === "http" || r.reason === "selfpage" || r.reason === "network")){
+    const parts = ROOT.replace(/^\/files\/?/, "").split("/").filter(Boolean);
+    while(parts.length){
+      parts.pop();
+      const candidate = "/files/" + (parts.length ? parts.map(encodeURIComponent).join("/") + "/" : "");
+      const testUrl = segments.length ? candidate + segments.map(encodeURIComponent).join("/") + "/" : candidate;
+      if(testUrl === url) continue;
+      const r2 = await getEntries(testUrl);
+      if(r2.ok){ BASE = candidate; url = testUrl; r = r2; break; }
+    }
+  }
+
+  if(r.ok) return r.entries; // a genuinely empty folder legitimately shows "Nothing here."
+
+  // Clear, specific diagnostics instead of the old misleading empty-state/JSON crash
+  if(r.reason === "http"){
+    if(r.status === 404) throw new Error("404 Not Found — that folder doesn't exist under the file-server root (check the ROOT setting in index.html against your Caddyfile root).");
+    if(r.status === 401 || r.status === 403) throw new Error(r.status+" — the archive asked for a login. Refresh the page and enter your username/password.");
+    throw new Error("HTTP "+r.status+" — folder not reachable.");
+  }
+  if(r.reason === "selfpage") throw new Error('The server returned the app page instead of a file listing — the listing URL ("'+BASE+'") is outside the file-server root configured in your Caddyfile. Adjust ROOT in index.html.');
+  if(r.reason === "htmlauth") throw new Error("A login/error page came back instead of a listing. Refresh and sign in.");
+  if(r.reason === "badjson") throw new Error("The server sent malformed JSON for the listing.");
+  if(r.reason === "empty-html") throw new Error("The server returned an HTML page with no parseable file links for "+BASE+".");
+  if(r.reason === "network") throw new Error("Network error — the tunnel or the local Caddy server may be down. Check cloudflared/Caddy are still running.");
+  throw new Error("Could not read the folder listing ("+r.reason+").");
 }
 
 /* ------------------------------------------------------------------
