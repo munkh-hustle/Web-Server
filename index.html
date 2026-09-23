@@ -657,11 +657,19 @@ main{ padding:clamp(26px,5vw,64px) var(--gutter) 120px; }
 /* ------------------------------------------------------------------
    CONFIG / helpers
    ------------------------------------------------------------------ */
-const ROOT = "/files/";
+// ROOT = the folder inside your file-server that the vault should show.
+// With the current Caddyfile (root "C:/") your files live under:
+//   /files/Users/PC/Downloads, /files/Users/PC/Documents, …
+// So we start there; if it ever 404s or returns an HTML page instead of
+// JSON, the fetcher below automatically falls back to shallower roots.
+const ROOT = "/files/Users/PC/";
 const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+let BASE = ROOT; // resolved root (may be adjusted by auto-discovery)
 
 const IMG_EXT = ["jpg","jpeg","png","gif","webp","avif","bmp","svg","heic","heif","tif","tiff"];
 const VID_EXT = ["mp4","webm","mov","m4v","ogv","mkv","avi"];
+const DOC_EXT = ["pdf","epub","mobi","azw3","doc","docx","xls","xlsx","ppt","pptx","odt","ods","odp","txt","md","rtf","csv","json","xml","html","htm","log","ini","env","yml","yaml","conf","py","js","ts","java","c","cpp","h","cs","go","rs","php","rb","sh","bat","ps1","sql","zip","rar","7z","tar","gz","bz2","xz","iso","dmg","exe","msi","apk","deb","rpm","appimage","wav","mp3","flac","aac","ogg","opus","wma","m4a","mid","midi"];
 
 const $  = (s,el=document)=>el.querySelector(s);
 const $$ = (s,el=document)=>Array.from(el.querySelectorAll(s));
@@ -676,6 +684,7 @@ function extOf(name){
 }
 function isImg(n){ return IMG_EXT.includes(extOf(n)); }
 function isVid(n){ return VID_EXT.includes(extOf(n)); }
+function isDoc(n){ return DOC_EXT.includes(extOf(n)); }
 function baseName(n){ const i=n.lastIndexOf("."); return i<0?n:n.slice(0,i); }
 function fmtSize(bytes){
   if(bytes==null || isNaN(bytes)) return "";
@@ -700,22 +709,138 @@ const crumbs     = $("#crumbs");
 const backBtn    = $("#backBtn");
 
 /* ------------------------------------------------------------------
-   FETCH LISTING (Caddy file_server browse JSON)
+   HTML LISTING FALLBACK PARSER
+   Parses Caddy's built-in browse page (or any simple file listing)
+   into entries — used when the server answers with HTML instead of
+   JSON, which caused: Unexpected token '<', "<!DOCTYPE "... is not valid JSON
    ------------------------------------------------------------------ */
+function parseHtmlListing(html){
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const out = [];
+  const seen = new Set();
+
+  // Strategy 1: tables (Caddy uses <table> rows: name / size / modified)
+  doc.querySelectorAll("tr").forEach(tr=>{
+    const a = tr.querySelector("a[href]");
+    if(!a) return;
+    let href = a.getAttribute("href") || "";
+    let name = decodeURIComponent(href.split("/").filter(Boolean).pop() || a.textContent.trim());
+    if(!name || name === ".." || seen.has(name)) return;
+    seen.add(name);
+    const tds = tr.querySelectorAll("td");
+    let size = null;
+    if(tds.length >= 2){
+      const m = (tds[1].textContent||"").trim().match(/([\d.,]+)\s*(B|KB|MB|GB|TB)/i);
+      if(m) size = Math.round(parseFloat(m[1].replace(/,/g,"")) * Math.pow(1024, ["b","kb","mb","gb","tb"].indexOf(m[2].toLowerCase())));
+    }
+    out.push({ name, isDir: href.endsWith("/") || !!a.dataset.dir, size, mod:null });
+  });
+
+  // Strategy 2: plain lists / links (e.g. nginx autoindex, Apache mod_autoindex)
+  if(!out.length){
+    doc.querySelectorAll("a[href]").forEach(a=>{
+      let href = a.getAttribute("href") || "";
+      if(/^[?#]/.test(href) || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) return; // skip sorting/external
+      let name = decodeURIComponent(href.replace(/\/$/,"").split("/").filter(Boolean).pop() || "");
+      if(!name || name === ".." || name === "." || seen.has(name)) return;
+      seen.add(name);
+      out.push({ name, isDir: href.endsWith("/"), size:null, mod:null });
+    });
+  }
+
+  // If nothing parsed but the page looks like an auth/error page, report it clearly
+  if(!out.length && /password|unauthorized|forbidden|log in|sign in|authentication/i.test(html)){
+    throw new Error("401 Unauthorized — the archive asked for a login (HTML page returned). Refresh and enter credentials.");
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------
+   FETCH LISTING (Caddy file_server browse JSON, with HTML fallback)
+   ------------------------------------------------------------------ */
+// Try to list `candidate`; returns entry array or null (never throws).
+async function tryList(candidate){
+  try{
+    const r = await fetch(candidate, { headers:{ "Accept":"application/json" }, cache:"no-store" });
+    if(!r.ok) return null;
+    const ct = (r.headers.get("Content-Type")||"").toLowerCase();
+    const t  = await r.text();
+    let a = [];
+    if(ct.includes("json")){
+      try{ const d = JSON.parse(t); a = Array.isArray(d)?d:(d.entries||d.items||[]); }catch(e){}
+    } else if(ct.includes("html") || t.trimStart().startsWith("<")){
+      if(/D201|id="main"|id="intro"/.test(t)) return null; // SPA fallback page → not a listing
+      try{ a = parseHtmlListing(t); }catch(e){ return null; }
+    }
+    return a.length ? a : null;
+  }catch(e){ return null; }
+}
+
 async function fetchListing(segments){
-  const url = segments.length ? buildURL(segments) + "/" : ROOT;
-  const res = await fetch(url, { headers:{ "Accept":"application/json" }, cache:"no-store" });
-  if(!res.ok) throw new Error("HTTP "+res.status);
-  const data = await res.json();
-  // Caddy returns an array of {name,size,url,mod_time,is_dir}
-  const arr = Array.isArray(data) ? data : (data.entries || data.items || []);
+  let url = segments.length ? buildURL(segments) + "/" : BASE;
+  let res = await fetch(url, { headers:{ "Accept":"application/json" }, cache:"no-store" });
+
+  // If the current BASE is wrong (404, or SPA/HTML returned), auto-discover:
+  // walk BASE up one folder at a time and re-try the requested path under it.
+  if(!res.ok || !(res.headers.get("Content-Type")||"").toLowerCase().includes("json")){
+    const text0 = res.ok ? await res.text() : "";
+    const looksLikeSpaOrErr = !res.ok || /D201|id="main"|id="intro"/.test(text0) || (!text0.trim().startsWith("[") && text0.trim().startsWith("<"));
+    if(looksLikeSpaOrErr){
+      const parts = BASE.replace(/^\/files\/?/,"").split("/").filter(Boolean);
+      outer:
+      while(parts.length){
+        parts.pop();
+        const candidate = "/files/" + (parts.length ? parts.map(encodeURIComponent).join("/")+"/" : "");
+        const testUrl = segments.length ? candidate + segments.map(encodeURIComponent).join("/")+"/" : candidate;
+        try{
+          const r2 = await fetch(testUrl, { headers:{ "Accept":"application/json" }, cache:"no-store" });
+          if(!r2.ok) continue;
+          const ct2 = (r2.headers.get("Content-Type")||"").toLowerCase();
+          const t2 = await r2.text();
+          let a2 = null;
+          if(ct2.includes("json")){
+            try{ const d2 = JSON.parse(t2); a2 = Array.isArray(d2)?d2:(d2.entries||d2.items||[]); }catch(e){}
+          } else if(/D201|id="main"|id="intro"/.test(t2)){
+            a2 = null;
+          } else {
+            try{ a2 = parseHtmlListing(t2); }catch(e){ a2 = null; }
+          }
+          if(a2 && a2.length){ BASE = candidate; res = r2; url = testUrl; break outer; }
+        }catch(e){ /* keep trying */ }
+      }
+      if(BASE === "/files/" && !segments.length && !res.ok){
+        // last resort: root of the file server
+        const a2 = await tryList("/files/");
+        if(a2){ BASE = "/files/"; res = await fetch("/files/", { headers:{ "Accept":"application/json" }, cache:"no-store" }); }
+      }
+    }
+  }
+
+  if(!res.ok) throw new Error("HTTP "+res.status+" — folder not reachable");
+
+  const ctype = (res.headers.get("Content-Type") || "").toLowerCase();
+  const text  = res.bodyUsed ? "" : await res.text();
+  let arr = [];
+
+  if(ctype.includes("json")){
+    try{
+      const data = JSON.parse(text);
+      arr = Array.isArray(data) ? data : (data.entries || data.items || []);
+    }catch(e){ /* fall through to HTML parsing */ }
+  }
+  if(!arr.length && (ctype.includes("html") || text.trimStart().startsWith("<"))){
+    // Server answered with an HTML browse page — parse it instead of failing on JSON
+    // (this is what previously produced: Unexpected token '<', "<!DOCTYPE "... is not valid JSON)
+    arr = parseHtmlListing(text);
+  }
+
   return arr.map(e=>({
-    name: e.name,
-    isDir: !!(e.is_dir || e.isDir || (e.name && e.name.endsWith("/"))),
-    size: e.size,
+    name: String(e.name || ""),
+    isDir: !!(e.is_dir || e.isDir || e.type === "directory" || (e.name && e.name.endsWith("/"))),
+    size: e.size != null ? e.size : null,
     mod:  e.mod_time || e.modTime || e.mtime || null
-  })).map(e=>({ ...e, name: e.name.replace(/\/$/,"") }))
-     .filter(e=> e.name && e.name!=="." && e.name!=="..");
+  })).map(e=>({ ...e, name: e.name.replace(/\/$/,"").split("/").filter(Boolean).pop() || e.name }))
+    .filter(e=> e.name && e.name !== "." && e.name !== "..");
 }
 
 /* ------------------------------------------------------------------
@@ -764,7 +889,10 @@ function render(entries){
   const folders = entries.filter(e=>e.isDir).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
   const photos  = entries.filter(e=>!e.isDir && isImg(e.name)).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
   const vids    = entries.filter(e=>!e.isDir && isVid(e.name)).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
-  const files   = entries.filter(e=>!e.isDir && !isImg(e.name) && !isVid(e.name)).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
+  // "Documents" section shows known file types (PDF, archives, docs, audio, code…)
+  const files   = entries.filter(e=>!e.isDir && !isImg(e.name) && !isVid(e.name) && isDoc(e.name)).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
+  // Anything else with an unknown/missing extension — still shown, never hidden.
+  const others  = entries.filter(e=>!e.isDir && !isImg(e.name) && !isVid(e.name) && !isDoc(e.name)).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
 
   // gallery source for lightbox
   galleryImages = photos.map(p=>({ name:p.name, url: buildURL([...path, p.name]) }));
@@ -812,10 +940,11 @@ function render(entries){
     out += makeSection("Motion", vids.length+" REELS", `<div class="videos">${items}</div>`);
   }
 
-  /* --- files --- */
-  if(files.length){
+  /* --- files (PDFs, docs, archives, audio, code…) --- */
+  const allFiles = files.concat(others);
+  if(allFiles.length){
     const dl = `<svg viewBox="0 0 24 24" fill="none" stroke-width="1.5"><path d="M12 4v11m0 0l-4-4m4 4l4-4M5 20h14"/></svg>`;
-    const items = files.map(f=>{
+    const items = allFiles.map(f=>{
       const u = buildURL([...path, f.name]);
       const ex = extOf(f.name).toUpperCase() || "FILE";
       return `<a class="fcard stag" href="${u}" download aria-label="Download ${esc(f.name)}">
@@ -827,7 +956,7 @@ function render(entries){
           <span class="dl">${dl}</span>
         </a>`;
     }).join("");
-    out += makeSection("Documents", files.length+" FILES", `<div class="files">${items}</div>`);
+    out += makeSection("Documents", allFiles.length+" FILES", `<div class="files">${items}</div>`);
   }
 
   main.innerHTML = out;
@@ -906,7 +1035,10 @@ async function load(){
     main.innerHTML = `<div class="state"><div class="inner">
         <div class="big">Reel unavailable.</div>
         <div class="small">Could not reach the archive.<br>${esc(err.message||"Unknown error")}</div>
+        <button class="back-btn" id="retryBtn" style="margin-top:26px;display:inline-flex">Retry</button>
       </div></div>`;
+    const rb = $("#retryBtn");
+    if(rb) rb.addEventListener("click", load);
   }
 }
 
