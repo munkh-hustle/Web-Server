@@ -657,15 +657,32 @@ main{ padding:clamp(26px,5vw,64px) var(--gutter) 120px; }
 /* ------------------------------------------------------------------
    CONFIG / helpers
    ------------------------------------------------------------------ */
-// ROOT = the folder inside your file-server that the vault should show.
-// With the current Caddyfile (root "C:/") your files live under:
-//   /files/Users/PC/Downloads, /files/Users/PC/Documents, …
-// So we start there; if it ever 404s or returns an HTML page instead of
-// JSON, the fetcher below automatically falls back to shallower roots.
-const ROOT = "/files/Users/PC/";
+/* ------------------------------------------------------------------\
+   CONFIG — you normally never need to touch anything below this line.
+   The app figures out where your Caddy file server starts all by itself:
+   it probes a few candidate prefixes at startup and uses the first one
+   that answers with a real directory listing. It also detects when the
+   prefix is mounted deeper than expected (e.g. tunnel serves
+   https://host/files/Users/PC/ as the site root) and rewrites paths
+   accordingly, so you never see "outside the file-server root" again.
+\*------------------------------------------------------------------ */
+// Preferred starting folder, relative to the drive root exposed by Caddy
+// (your Caddyfile: handle_path /files/* -> root "C:/").
+// Change this to e.g. "/Users/PC/Downloads/" if you want the vault to open there.
+const VAULT_START = "/Users/PC/";
+
+// Candidate URL prefixes to probe for the file server, in order.
+// "" means the site root itself (happens when the tunnel/host serves the
+// folder directly). Add more candidates here if your mount differs.
+const PREFIX_CANDIDATES = ["/files", "", "/files/", "/static", "/vault"];
+
+// If the probes all fail, fall back to this explicit prefix (edit if needed):
+const FALLBACK_PREFIX = "/files";
+
 const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-let BASE = ROOT; // resolved root (may be adjusted by auto-discovery)
+let BASE = null;   // resolved absolute listing base, e.g. "https://host/files/Users/PC/"
+let ROOT = null;   // same value, kept for readability of older code
 
 const IMG_EXT = ["jpg","jpeg","png","gif","webp","avif","bmp","svg","heic","heif","tif","tiff"];
 const VID_EXT = ["mp4","webm","mov","m4v","ogv","mkv","avi"];
@@ -675,8 +692,9 @@ const $  = (s,el=document)=>el.querySelector(s);
 const $$ = (s,el=document)=>Array.from(el.querySelectorAll(s));
 
 // Encode each path segment individually so spaces / special chars survive.
+// BASE is resolved at startup (see resolveBase) — e.g. "/files/Users/PC/".
 function buildURL(pathSegments){
-  return ROOT + pathSegments.map(encodeURIComponent).join("/");
+  return BASE + pathSegments.map(encodeURIComponent).join("/") + (pathSegments.length ? "/" : "");
 }
 function extOf(name){
   const i = name.lastIndexOf(".");
@@ -709,52 +727,10 @@ const crumbs     = $("#crumbs");
 const backBtn    = $("#backBtn");
 
 /* ------------------------------------------------------------------
-   HTML LISTING FALLBACK PARSER
-   Parses Caddy's built-in browse page (or any simple file listing)
-   into entries — used when the server answers with HTML instead of
-   JSON, which caused: Unexpected token '<', "<!DOCTYPE "... is not valid JSON
+   SELF-PAGE DETECTION
+   Our own SPA contains these markers; if a listing URL returns this
+   page, the file server isn't mounted there (try_files fallback).
    ------------------------------------------------------------------ */
-function parseHtmlListing(html){
-  const doc = new DOMParser().parseFromString(html, "text/html");
-  const out = [];
-  const seen = new Set();
-
-  // Strategy 1: tables (Caddy uses <table> rows: name / size / modified)
-  doc.querySelectorAll("tr").forEach(tr=>{
-    const a = tr.querySelector("a[href]");
-    if(!a) return;
-    let href = a.getAttribute("href") || "";
-    let name = decodeURIComponent(href.split("/").filter(Boolean).pop() || a.textContent.trim());
-    if(!name || name === ".." || seen.has(name)) return;
-    seen.add(name);
-    const tds = tr.querySelectorAll("td");
-    let size = null;
-    if(tds.length >= 2){
-      const m = (tds[1].textContent||"").trim().match(/([\d.,]+)\s*(B|KB|MB|GB|TB)/i);
-      if(m) size = Math.round(parseFloat(m[1].replace(/,/g,"")) * Math.pow(1024, ["b","kb","mb","gb","tb"].indexOf(m[2].toLowerCase())));
-    }
-    out.push({ name, isDir: href.endsWith("/") || !!a.dataset.dir, size, mod:null });
-  });
-
-  // Strategy 2: plain lists / links (e.g. nginx autoindex, Apache mod_autoindex)
-  if(!out.length){
-    doc.querySelectorAll("a[href]").forEach(a=>{
-      let href = a.getAttribute("href") || "";
-      if(/^[?#]/.test(href) || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) return; // skip sorting/external
-      let name = decodeURIComponent(href.replace(/\/$/,"").split("/").filter(Boolean).pop() || "");
-      if(!name || name === ".." || name === "." || seen.has(name)) return;
-      seen.add(name);
-      out.push({ name, isDir: href.endsWith("/"), size:null, mod:null });
-    });
-  }
-
-  // If nothing parsed but the page looks like an auth/error page, report it clearly
-  if(!out.length && /password|unauthorized|forbidden|log in|sign in|authentication/i.test(html)){
-    throw new Error("401 Unauthorized — the archive asked for a login (HTML page returned). Refresh and enter credentials.");
-  }
-  return out;
-}
-
 /* ------------------------------------------------------------------
    FETCH LISTING (Caddy file_server browse JSON, with HTML fallback)
    ------------------------------------------------------------------ */
@@ -780,74 +756,219 @@ async function getEntries(url){
   let text;
   try{ text = await res.text(); }catch(e){ return { ok:false, reason:"network" }; }
 
-  let arr = [];
-  const looksHtml = ctype.includes("html") || text.trimStart().startsWith("<");
+  // Unified parser: handles Caddy JSON listings AND HTML browse pages
+  // (Caddy/nginx/Apache). Returns null when the body is not a listing at all.
+  let parsed = null;
+  try{ parsed = parseListingBody(text, url); }catch(e){ parsed = null; }
 
-  if(ctype.includes("json")){
-    try{
-      const data = JSON.parse(text);
-      arr = Array.isArray(data) ? data : (data.entries || data.items || []);
-    }catch(e){ /* fall through to HTML path below */ }
-  }
-
-  if(!arr.length && looksHtml){
+  if(parsed == null){
+    if(res.status === 401 || res.status === 403) return { ok:false, reason:"auth", status:res.status };
     if(isSelfPage(text)){
       // The SPA itself was echoed back → this URL isn't really served by the
       // file server (wrong prefix / try_files fallback). Treat as unreachable.
       return { ok:false, reason:"selfpage", status:res.status };
     }
-    // A genuine Caddy/nginx browse page. If it contains zero links, the folder
-    // is truly empty — that's a successful listing with no entries, NOT an error.
-    try{ arr = parseHtmlListing(text); }catch(e){ arr = []; }
-  } else if(!arr.length && !looksHtml && !ctype.includes("json")){
-    return { ok:false, reason:"unknown", status:res.status };
+    // Some other HTML page (a real browse page with zero entries is parsed to
+    // [] above, never null) — treat as not-a-listing so auto-discovery moves on.
+    return { ok:false, reason:"notlisting", status:res.status };
   }
-  // anything left over (JSON parsed to [], or empty-body) is simply an empty folder
 
-  const entries = arr.map(e=>({
-    name: String(e.name || ""),
-    isDir: !!(e.is_dir || e.isDir || e.type === "directory" || (e.name && e.name.endsWith("/"))),
-    size: e.size != null ? e.size : null,
-    mod:  e.mod_time || e.modTime || e.mtime || null
-  })).map(e=>({ ...e, name: decodeURIComponent(e.name.replace(/\/$/,"").split("/").filter(Boolean).pop() || e.name) }))
-    .filter(e=> e.name && e.name !== "." && e.name !== "..");
-
-  return { ok:true, entries };
+  return { ok:true, entries: parsed };
 }
 
-async function fetchListing(segments){
-  let url = segments.length ? buildURL(segments) + "/" : BASE;
-  let r = await getEntries(url);
+/* ------------------------------------------------------------------
+   AUTO-CONFIG: find where the file server actually lives.
 
-  // If the configured ROOT is wrong (404 / app-page echoed back / unreachable),
-  // auto-discover: walk up one folder at a time from ROOT and re-try the same
-  // relative path under each shallower base. First success updates BASE.
-  if(!r.ok && (r.reason === "http" || r.reason === "selfpage" || r.reason === "network")){
-    const parts = ROOT.replace(/^\/files\/?/, "").split("/").filter(Boolean);
-    while(parts.length){
-      parts.pop();
-      const candidate = "/files/" + (parts.length ? parts.map(encodeURIComponent).join("/") + "/" : "");
-      const testUrl = segments.length ? candidate + segments.map(encodeURIComponent).join("/") + "/" : candidate;
-      if(testUrl === url) continue;
-      const r2 = await getEntries(testUrl);
-      if(r2.ok){ BASE = candidate; url = testUrl; r = r2; break; }
+   Problems this solves (all seen in your setup):
+   - Caddy's browse pages contain hidden sort links (?dir=true etc.), so
+     a naive HTML parser reported "files found" even for EMPTY folders.
+     We now strip query/fragment URLs before parsing.
+   - basic_auth can answer some requests with an auth/login page that
+     still contains links — we reject any page that mentions login/auth.
+   - The tunnel may serve the app at "/", "/index.html" AND on unknown
+     deep paths (SPA-style routing), which used to make the app think
+     every URL was "the app page". We only trust the self-page signal
+     for same-origin URLs that look like the app's own location.
+   - Most importantly: instead of hardcoding one ROOT, we probe several
+     candidate prefixes ("/files", site root, …) plus deeper mounts of
+     VAULT_START, and pick the first that returns a real listing.
+   ------------------------------------------------------------------ */
+
+// Parse a directory-listing response body into entries.
+// Handles: Caddy JSON listings, Caddy/nginx/Apache HTML browse pages.
+// Returns null when the body is NOT a listing (our SPA, an auth page, etc).
+function parseListingBody(text, reqPath){
+  const t = text.trimStart();
+
+  // ---- JSON (Caddy answers this when Accept includes application/json) ----
+  if(!t.startsWith("<")){
+    try{
+      const d = JSON.parse(t);
+      const arr = Array.isArray(d) ? d : (d && (d.entries || d.items)) || null;
+      if(arr == null) return null;
+      return arr.map(e=>({
+        name: decodeURIComponent(String(e.name||"").replace(/\/$/,"")),
+        isDir: !!(e.is_dir || e.isDir || e.type === "directory" || String(e.name||"").endsWith("/")),
+        size: e.size != null ? e.size : null
+      })).filter(e=>e.name && e.name!=="." && e.name!=="..");
+    }catch(e){ return null; }
+  }
+
+  // ---- HTML ----
+  if(isSelfPage(text)) return null;   // our own SPA echoed back by try_files
+  const doc = new DOMParser().parseFromString(text, "text/html");
+  const title = (doc.title||"").toLowerCase();
+  const bodyTxt = (doc.body && doc.body.textContent || "").trim();
+  // error / auth pages that still contain links must not be mistaken for listings
+  if(/login|sign in|password|unauthorized|forbidden|error|not found/i.test(title)) return null;
+  if(/^(401|403|404|500)/.test(bodyTxt)) return null;
+
+  // Resolve hrefs against the REQUEST url — relative links like "./foo/" and
+  // "../" only make sense there, never against a dummy base.
+  let baseHref;
+  try{ baseHref = new URL(reqPath, location.origin).href; }catch(e){ baseHref = location.href; }
+
+  const out = [];
+  const seen = new Set();
+  // Normalised path of the directory we requested (trailing slash kept).
+  let reqPathNorm;
+  try{ reqPathNorm = decodeURIComponent(new URL(baseHref).pathname); }catch(e){ reqPathNorm = baseHref; }
+  if(!reqPathNorm.endsWith("/")) reqPathNorm += "/";
+
+  doc.querySelectorAll("a[href]").forEach(a=>{
+    const raw = a.getAttribute("href") || "";
+    if(!raw || raw[0]==="#" || /^javascript:/i.test(raw) || /^mailto:/i.test(raw)) return;
+    let u;
+    try{ u = new URL(raw, baseHref); }catch(e){ return; }
+    if(u.origin !== location.origin) return;                 // external (caddyserver.com footer…)
+    if(u.search || u.hash) return;                           // sort links (?sort=name&order=asc)
+    let rel = u.pathname;
+    let full;
+    try{ full = decodeURIComponent(rel); }catch(e){ full = rel; }
+    if(full === "/" || full === "") return;                  // site-root link
+    const isDir = full.endsWith("/");
+    // A real listing entry is EXACTLY one segment deeper than the requested
+    // directory. This rejects "../", "../../" parent links and any canonical
+    // self-link ("/files/Users/PC/" resolving to itself → depth 0).
+    if(!full.startsWith(reqPathNorm)) return;
+    const rest = full.slice(reqPathNorm.length).replace(/\/$/, "");
+    if(!rest || rest.includes("/")) return;
+    const name = rest;
+    if(name === "." || name === "..") return;
+    if(seen.has(full)) return;
+    seen.add(full);
+    let size = null;
+    const tr = a.closest("tr");
+    if(tr){
+      const m = (tr.textContent||"").match(/([\d.,]+)\s*(B|KB|MB|GB|TB)\b/i);
+      if(m) size = Math.round(parseFloat(m[1].replace(/,/g,"")) * Math.pow(1024, ["b","kb","mb","gb","tb"].indexOf(m[2].toLowerCase())));
+    }
+    out.push({ name, isDir, size });
+  });
+  return out;
+}
+
+// Probe one absolute-path listing URL. Returns entries array or null.
+// Also records the last failure kind so diagnostics can mention logins.
+let lastProbeFail = null;
+async function probeUrl(pathUrl){
+  const r = await getEntries(pathUrl);
+  if(r.ok) return r.entries;
+  lastProbeFail = r.reason + (r.status ? " "+r.status : "");
+  return null;
+}
+
+let resolvedPrefix = null;   // e.g. "/files" or "" — where file_server starts
+let prefixIsDeep = false;    // true when the prefix itself IS the vault start (mount/deeper serving)
+
+async function resolveBase(){
+  if(BASE) return BASE;
+  const origin = location.origin;
+  const startSegs = VAULT_START.split("/").filter(Boolean).map(encodeURIComponent); // ["Users","PC"]
+
+  // Phase 1: classic mount — prefix + VAULT_START. Try candidates in order,
+  // then walk the prefix UP (deeper mounts sometimes live under more segments).
+  const tried = new Set();
+  async function tryPrefix(p){
+    if(tried.has(p)) return null;
+    tried.add(p);
+    const url = origin + p + "/" + startSegs.join("/") + "/";
+    return await probeUrl(url);
+  }
+  for(const cand of PREFIX_CANDIDATES){
+    let entries = await tryPrefix(cand);
+    if(entries){ resolvedPrefix = cand.replace(/\/+$/,""); BASE = origin + resolvedPrefix + "/" + startSegs.join("/") + "/"; return BASE; }
+    // also try the prefix alone (maybe the server root already IS the vault)
+    const solo = origin + (cand ? cand.replace(/\/+$/,"") + "/" : "");
+    if(!tried.has(solo)){
+      tried.add(solo);
+      entries = await probeUrl(solo);
+      if(entries){ resolvedPrefix = cand.replace(/\/+$/,""); prefixIsDeep = true; BASE = solo; return BASE; }
     }
   }
 
-  if(r.ok) return r.entries; // a genuinely empty folder legitimately shows "Nothing here."
-
-  // Clear, specific diagnostics instead of the old misleading empty-state/JSON crash
-  if(r.reason === "http"){
-    if(r.status === 404) throw new Error("404 Not Found — that folder doesn't exist under the file-server root (check the ROOT setting in index.html against your Caddyfile root).");
-    if(r.status === 401 || r.status === 403) throw new Error(r.status+" — the archive asked for a login. Refresh the page and enter your username/password.");
-    throw new Error("HTTP "+r.status+" — folder not reachable.");
+  // Phase 2: the prefix might be mounted DEEPER than expected, e.g. the tunnel
+  // serves https://host/files/Users/PC/ as its root. Detect via the current
+  // page URL: if it ends with a known suffix, the part before it is a base.
+  let pp = decodeURIComponent(location.pathname);
+  for(const suf of ["/index.html", "/"]){
+    if(pp.endsWith(suf)){
+      const base = pp.slice(0, pp.length - suf.length);
+      if(base){
+        const url = origin + base.split("/").filter(Boolean).map(encodeURIComponent).join("/") + "/";
+        const entries = await probeUrl(url);
+        if(entries){ resolvedPrefix = base; prefixIsDeep = true; BASE = url; return BASE; }
+      }
+      break;
+    }
   }
-  if(r.reason === "selfpage") throw new Error('The server returned the app page instead of a file listing — the listing URL ("'+BASE+'") is outside the file-server root configured in your Caddyfile. Adjust ROOT in index.html.');
-  if(r.reason === "htmlauth") throw new Error("A login/error page came back instead of a listing. Refresh and sign in.");
-  if(r.reason === "badjson") throw new Error("The server sent malformed JSON for the listing.");
-  if(r.reason === "empty-html") throw new Error("The server returned an HTML page with no parseable file links for "+BASE+".");
-  if(r.reason === "network") throw new Error("Network error — the tunnel or the local Caddy server may be down. Check cloudflared/Caddy are still running.");
-  throw new Error("Could not read the folder listing ("+r.reason+").");
+
+  // Phase 3: last resort — shallow-walk up from FALLBACK_PREFIX + VAULT_START
+  // looking for ANY reachable listing, so the user at least sees something.
+  let segs = startSegs.slice();
+  while(segs.length){
+    segs.pop();
+    const url = origin + FALLBACK_PREFIX + "/" + segs.join("/") + (segs.length?"/":"");
+    const entries = await probeUrl(url);
+    if(entries){
+      resolvedPrefix = FALLBACK_PREFIX;
+      BASE = origin + FALLBACK_PREFIX + "/" + startSegs.join("/") + "/";
+      return BASE;
+    }
+  }
+
+    const hint = lastProbeFail && /auth|401|403/.test(lastProbeFail)
+      ? " The server asked for a login (basic_auth) \u2014 open "+location.origin+FALLBACK_PREFIX+"/ in a new tab, sign in as PC, then hit Retry."
+      : (lastProbeFail ? " Last probe failed with: "+lastProbeFail+"." : "");
+    throw new Error("Could not locate the file server. Probed: "+Array.from(tried).slice(0,8).join(", ")+"."+hint+" Adjust VAULT_START / PREFIX_CANDIDATES near the top of index.html if your layout differs.");
+}
+
+async function fetchListing(segments){
+  await resolveBase();
+  const url = buildURL(segments);
+  const r = await getEntries(url);
+
+  if(!r.ok){
+    // One recovery attempt: maybe the resolved base went stale/wrong — clear it
+    // and re-resolve once.
+    BASE = null; prefixIsDeep = false; resolvedPrefix = null;
+    await resolveBase();
+    const r2 = await getEntries(buildURL(segments));
+    if(r2.ok) return r2.entries;
+
+    const shown = buildURL(segments);
+    if(r2.reason === "http"){
+      if(r2.status === 404) throw new Error("404 Not Found — "+shown+" doesn't exist on the server. Check VAULT_START in index.html against your Caddyfile root.");
+      if(r2.status === 401 || r2.status === 403) throw new Error(r2.status+" — the archive asked for a login. Refresh the page and enter your username/password.");
+      throw new Error("HTTP "+r2.status+" — folder not reachable ("+shown+").");
+    }
+    if(r2.reason === "selfpage") throw new Error('The server returned the app page instead of a file listing for "'+shown+'". Your Caddyfile\'s handle_path prefix probably differs from what we probed — set FALLBACK_PREFIX near the top of index.html.');
+    if(r2.reason === "notlisting") throw new Error("The URL \""+shown+"\" answered with a page that is not a directory listing (an error or login page). Open it in a new tab to see what the server says.");
+    if(r2.reason === "auth") throw new Error("The archive asked for a login before serving listings. Open "+shown+" directly in a new tab, sign in with your Caddy credentials, then come back and hit Retry.");
+    if(r2.reason === "network") throw new Error("Network error — the tunnel or the local Caddy server may be down. Check cloudflared/Caddy are still running.");
+    throw new Error("Could not read the folder listing of "+shown+" ("+r2.reason+").");
+  }
+  return r.entries; // a genuinely empty folder legitimately shows "Nothing here."
 }
 
 /* ------------------------------------------------------------------
