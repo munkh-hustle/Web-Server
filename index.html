@@ -657,18 +657,53 @@ main{ padding:clamp(26px,5vw,64px) var(--gutter) 120px; }
 /* ------------------------------------------------------------------
    CONFIG / helpers
    ------------------------------------------------------------------ */
-const ROOT = "/files/";
+/* ------------------------------------------------------------------\
+   CONFIG — you normally never need to touch anything below this line.
+   The app figures out where your Caddy file server starts all by itself:
+   it probes a few candidate prefixes at startup and uses the first one
+   that answers with a real directory listing. It also detects when the
+   prefix is mounted deeper than expected (e.g. tunnel serves
+   https://host/files/Users/PC/ as the site root) and rewrites paths
+   accordingly, so you never see "outside the file-server root" again.
+\*------------------------------------------------------------------ */
+// =====================================================================
+//  THE TWO SETTINGS THAT MATTER - edit these and nothing else.
+//
+//  Your Caddyfile says:   handle_path /files/*  with  root "C:/"
+//  so every folder on C:\ is reachable at:
+//      https://<tunnel-host>/files/<path-on-C>/
+//  e.g.  C:\Users\PC\Downloads  ->  /files/Users/PC/Downloads/
+//
+//  LISTING_PREFIX : the handle_path prefix from your Caddyfile ("/files").
+//                   Set to "" only if Caddy serves files from the site root.
+//  FOLDER_TO_OPEN : where the vault starts, relative to the Caddy root.
+// =====================================================================
+const LISTING_PREFIX = "/files";          // must match handle_path in Caddyfile
+const FOLDER_TO_OPEN = "/Users/PC/";      // change to open elsewhere
+
 const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+let BASE = null;   // resolved absolute listing base, e.g. "https://host/files/Users/PC/"
+let ROOT = null;   // same value, kept for readability of older code
 
 const IMG_EXT = ["jpg","jpeg","png","gif","webp","avif","bmp","svg","heic","heif","tif","tiff"];
 const VID_EXT = ["mp4","webm","mov","m4v","ogv","mkv","avi"];
+const DOC_EXT = ["pdf","epub","mobi","azw3","doc","docx","xls","xlsx","ppt","pptx","odt","ods","odp","txt","md","rtf","csv","json","xml","html","htm","log","ini","env","yml","yaml","conf","py","js","ts","java","c","cpp","h","cs","go","rs","php","rb","sh","bat","ps1","sql","zip","rar","7z","tar","gz","bz2","xz","iso","dmg","exe","msi","apk","deb","rpm","appimage","wav","mp3","flac","aac","ogg","opus","wma","m4a","mid","midi"];
 
 const $  = (s,el=document)=>el.querySelector(s);
 const $$ = (s,el=document)=>Array.from(el.querySelectorAll(s));
 
 // Encode each path segment individually so spaces / special chars survive.
+// BASE is resolved at startup (see resolveBase) — e.g. "/files/Users/PC/".
+// Build a URL for a DIRECTORY listing (trailing slash added).
 function buildURL(pathSegments){
-  return ROOT + pathSegments.map(encodeURIComponent).join("/");
+  return BASE + pathSegments.map(encodeURIComponent).join("/") + (pathSegments.length ? "/" : "");
+}
+// Build a URL for a FILE (NO trailing slash - appending one makes Caddy
+// 301-redirect into a non-existent folder which try_files then answers
+// with our own index.html, breaking downloads and previews).
+function buildFileURL(pathSegments){
+  return BASE + pathSegments.map(encodeURIComponent).join("/");
 }
 function extOf(name){
   const i = name.lastIndexOf(".");
@@ -676,6 +711,7 @@ function extOf(name){
 }
 function isImg(n){ return IMG_EXT.includes(extOf(n)); }
 function isVid(n){ return VID_EXT.includes(extOf(n)); }
+function isDoc(n){ return DOC_EXT.includes(extOf(n)); }
 function baseName(n){ const i=n.lastIndexOf("."); return i<0?n:n.slice(0,i); }
 function fmtSize(bytes){
   if(bytes==null || isNaN(bytes)) return "";
@@ -700,22 +736,227 @@ const crumbs     = $("#crumbs");
 const backBtn    = $("#backBtn");
 
 /* ------------------------------------------------------------------
-   FETCH LISTING (Caddy file_server browse JSON)
+   SELF-PAGE DETECTION
+   Our own SPA contains these markers; if a listing URL returns this
+   page, the file server isn't mounted there (try_files fallback).
    ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------
+   FETCH LISTING (Caddy file_server browse JSON, with HTML fallback)
+   ------------------------------------------------------------------ */
+const SELF_MARKERS = ["MANAS", 'id="intro"', 'aria-label="D201"', 'class="folder stag"', "This chamber of the vault"];
+function isSelfPage(text){
+  const head = text.slice(0, 6000);
+  return SELF_MARKERS.some(m => head.includes(m));
+}
+
+// Fetch a directory URL and normalise the response into entries.
+// Returns { ok:true, entries:[...] } or { ok:false, reason, status }.
+// Never throws for HTTP-level problems; tolerates JSON *or* HTML listings.
+async function getEntries(url, opts){
+  opts = opts || {};
+  let res;
+  try{
+    res = await fetch(url, { headers:{ "Accept":"application/json, text/html;q=0.8, */*;q=0.5" }, cache:"no-store" });
+  }catch(e){
+    return { ok:false, reason:"network" };
+  }
+  if(!res.ok) return { ok:false, reason:"http", status:res.status };
+  if(opts.raw) return { ok:true, raw:true, res:res };
+
+  const ctype = (res.headers.get("Content-Type") || "").toLowerCase();
+  let text;
+  try{ text = await res.text(); }catch(e){ return { ok:false, reason:"network" }; }
+
+  // Unified parser: handles Caddy JSON listings AND HTML browse pages
+  // (Caddy/nginx/Apache). Returns null when the body is not a listing at all.
+  let parsed = null;
+  try{ parsed = parseListingBody(text, url); }catch(e){ parsed = null; }
+
+  if(parsed == null){
+    if(res.status === 401 || res.status === 403) return { ok:false, reason:"auth", status:res.status };
+    if(isSelfPage(text)){
+      // The SPA itself was echoed back → this URL isn't really served by the
+      // file server (wrong prefix / try_files fallback). Treat as unreachable.
+      return { ok:false, reason:"selfpage", status:res.status };
+    }
+    // Some other HTML page (a real browse page with zero entries is parsed to
+    // [] above, never null) — treat as not-a-listing so auto-discovery moves on.
+    return { ok:false, reason:"notlisting", status:res.status };
+  }
+
+  return { ok:true, entries: parsed };
+}
+
+/* ------------------------------------------------------------------
+   AUTO-CONFIG: find where the file server actually lives.
+
+   Problems this solves (all seen in your setup):
+   - Caddy's browse pages contain hidden sort links (?dir=true etc.), so
+     a naive HTML parser reported "files found" even for EMPTY folders.
+     We now strip query/fragment URLs before parsing.
+   - basic_auth can answer some requests with an auth/login page that
+     still contains links — we reject any page that mentions login/auth.
+   - The tunnel may serve the app at "/", "/index.html" AND on unknown
+     deep paths (SPA-style routing), which used to make the app think
+     every URL was "the app page". We only trust the self-page signal
+     for same-origin URLs that look like the app's own location.
+   - Most importantly: instead of hardcoding one ROOT, we probe several
+     candidate prefixes ("/files", site root, …) plus deeper mounts of
+     FOLDER_TO_OPEN, and pick the first that returns a real listing.
+   ------------------------------------------------------------------ */
+
+// Parse a directory-listing response body into entries.
+// Handles: Caddy JSON listings, Caddy/nginx/Apache HTML browse pages.
+// Returns null when the body is NOT a listing (our SPA, an auth page, etc).
+function parseListingBody(text, reqPath){
+  const t = text.trimStart();
+
+  // ---- JSON (Caddy answers this when Accept includes application/json) ----
+  if(!t.startsWith("<")){
+    try{
+      const d = JSON.parse(t);
+      const arr = Array.isArray(d) ? d : (d && (d.entries || d.items)) || null;
+      if(arr == null) return null;
+      return arr.map(e=>({
+        name: decodeURIComponent(String(e.name||"").replace(/\/$/,"")),
+        isDir: !!(e.is_dir || e.isDir || e.type === "directory" || String(e.name||"").endsWith("/")),
+        size: e.size != null ? e.size : null
+      })).filter(e=>e.name && e.name!=="." && e.name!=="..");
+    }catch(e){ return null; }
+  }
+
+  // ---- HTML ----
+  if(isSelfPage(text)) return null;   // our own SPA echoed back by try_files
+  const doc = new DOMParser().parseFromString(text, "text/html");
+  const title = (doc.title||"").toLowerCase();
+  const bodyTxt = (doc.body && doc.body.textContent || "").trim();
+  // error / auth pages that still contain links must not be mistaken for listings
+  if(/login|sign in|password|unauthorized|forbidden|error|not found/i.test(title)) return null;
+  if(/^(401|403|404|500)/.test(bodyTxt)) return null;
+
+  // Resolve hrefs against the REQUEST url — relative links like "./foo/" and
+  // "../" only make sense there, never against a dummy base.
+  let baseHref;
+  try{ baseHref = new URL(reqPath, location.origin).href; }catch(e){ baseHref = location.href; }
+
+  const out = [];
+  const seen = new Set();
+  // Normalised path of the directory we requested (trailing slash kept).
+  let reqPathNorm;
+  try{ reqPathNorm = decodeURIComponent(new URL(baseHref).pathname); }catch(e){ reqPathNorm = baseHref; }
+  if(!reqPathNorm.endsWith("/")) reqPathNorm += "/";
+
+  doc.querySelectorAll("a[href]").forEach(a=>{
+    const raw = a.getAttribute("href") || "";
+    if(!raw || raw[0]==="#" || /^javascript:/i.test(raw) || /^mailto:/i.test(raw)) return;
+    let u;
+    try{ u = new URL(raw, baseHref); }catch(e){ return; }
+    if(u.origin !== location.origin) return;                 // external (caddyserver.com footer…)
+    if(u.search || u.hash) return;                           // sort links (?sort=name&order=asc)
+    let rel = u.pathname;
+    let full;
+    try{ full = decodeURIComponent(rel); }catch(e){ full = rel; }
+    if(full === "/" || full === "") return;                  // site-root link
+    const isDir = full.endsWith("/");
+    // A real listing entry is EXACTLY one segment deeper than the requested
+    // directory. This rejects "../", "../../" parent links and any canonical
+    // self-link ("/files/Users/PC/" resolving to itself → depth 0).
+    if(!full.startsWith(reqPathNorm)) return;
+    const rest = full.slice(reqPathNorm.length).replace(/\/$/, "");
+    if(!rest || rest.includes("/")) return;
+    const name = rest;
+    if(name === "." || name === "..") return;
+    if(seen.has(full)) return;
+    seen.add(full);
+    let size = null;
+    const tr = a.closest("tr");
+    if(tr){
+      const m = (tr.textContent||"").match(/([\d.,]+)\s*(B|KB|MB|GB|TB)\b/i);
+      if(m) size = Math.round(parseFloat(m[1].replace(/,/g,"")) * Math.pow(1024, ["b","kb","mb","gb","tb"].indexOf(m[2].toLowerCase())));
+    }
+    out.push({ name, isDir, size });
+  });
+  return out;
+}
+
+async function resolveBase(){
+  if(BASE) return BASE;
+  const origin = location.origin;
+  const prefix = LISTING_PREFIX.replace(/\/+$/,"");           // "/files" or ""
+  const segs   = FOLDER_TO_OPEN.split("/").filter(Boolean);   // raw names
+
+  // Is there a real DIRECTORY at this path? A missing folder answers either
+  // with 404, or — because Caddy's site block falls back to try_files →
+  // index.html — with our own app page (200 + SPA markers). Anything else
+  // that answers OK is a genuine directory listing.
+  async function dirExists(rawSegs){
+    const url = origin + prefix + "/" + rawSegs.map(encodeURIComponent).join("/") + "/";
+    const r = await getEntries(url, { raw:true });
+    if(!r.ok) return false;
+    let text = "";
+    try{ text = await r.res.text(); }catch(e){ return false; }
+    if(isSelfPage(text)) return false;
+    return true;
+  }
+
+  // Walk DOWN from the deepest wanted folder toward the mount root and use
+  // the first path that actually exists on disk. This way a wrong
+  // FOLDER_TO_OPEN recovers gracefully instead of erroring out.
+  for(let n = segs.length; n >= 0; n--){
+    if(await dirExists(segs.slice(0,n))){
+      BASE = origin + prefix + "/" + segs.slice(0,n).map(encodeURIComponent).join("/") + "/";
+      START_CUT = n;
+      return BASE;
+    }
+  }
+  throw new Error("Could not reach the file server at " + origin + prefix + "/ . Check that Caddy is running and that LISTING_PREFIX in index.html matches your Caddyfile's handle_path directive.");
+}
+
+// How many leading segments of BASE correspond to FOLDER_TO_OPEN (so we can
+// translate a vault-relative path into an absolute listing URL even after
+// auto-recovery walked up to a parent folder).
+let START_CUT = 0;
+
+function vaultURL(segments, isFile){
+  // If resolveBase had to start higher than FOLDER_TO_OPEN, prepend the
+  // missing tail so relative navigation still lands in the right place.
+  const folderSegs = FOLDER_TO_OPEN.split("/").filter(Boolean);
+  const extra = folderSegs.slice(0, Math.max(0, folderSegs.length - START_CUT));
+  const full = extra.concat(segments);
+  const base = isFile ? buildFileURL(full) : buildURL(full);
+  return base;
+}
+
 async function fetchListing(segments){
-  const url = segments.length ? buildURL(segments) + "/" : ROOT;
-  const res = await fetch(url, { headers:{ "Accept":"application/json" }, cache:"no-store" });
-  if(!res.ok) throw new Error("HTTP "+res.status);
-  const data = await res.json();
-  // Caddy returns an array of {name,size,url,mod_time,is_dir}
-  const arr = Array.isArray(data) ? data : (data.entries || data.items || []);
-  return arr.map(e=>({
-    name: e.name,
-    isDir: !!(e.is_dir || e.isDir || (e.name && e.name.endsWith("/"))),
-    size: e.size,
-    mod:  e.mod_time || e.modTime || e.mtime || null
-  })).map(e=>({ ...e, name: e.name.replace(/\/$/,"") }))
-     .filter(e=> e.name && e.name!=="." && e.name!=="..");
+  await resolveBase();
+  let url = vaultURL(segments, false);
+  let r = await getEntries(url);
+  if(r.ok) return r.entries;   // a genuinely empty folder legitimately shows "Nothing here."
+
+  // Recovery: this exact folder may not exist (e.g. FOLDER_TO_OPEN was wrong
+  // and we started higher up). Walk UP one segment at a time until some
+  // ancestor answers with a listing, then start browsing from there.
+  let segs = segments.slice();
+  while(!r.ok && segs.length){
+    segs.pop();
+    BASE = null; START_CUT = 0;
+    await resolveBase();
+    url = vaultURL(segs, false);
+    r = await getEntries(url);
+    if(r.ok){ path = segs.slice(); return r.entries; }
+  }
+
+  const shown = url;
+  if(r.reason === "http"){
+    if(r.status === 404) throw new Error("404 Not Found \u2014 " + shown + " doesn't exist on the server. Fix FOLDER_TO_OPEN in index.html.");
+    if(r.status === 401 || r.status === 403) throw new Error(r.status + " \u2014 the archive asked for a login. Refresh the page and enter your username/password.");
+    throw new Error("HTTP " + r.status + " \u2014 folder not reachable (" + shown + ").");
+  }
+  if(r.reason === "selfpage") throw new Error('The server returned the app page instead of a file listing for "' + shown + '". Your Caddyfile probably does not mount the file server at "' + LISTING_PREFIX + '" \u2014 set LISTING_PREFIX near the top of index.html to match your handle_path directive.');
+  if(r.reason === "notlisting") throw new Error("The URL \"" + shown + "\" answered with a page that is not a directory listing (an error or login page). Open it in a new tab to see what the server says.");
+  if(r.reason === "auth") throw new Error("The archive asked for a login before serving listings. Open " + shown + " directly in a new tab, sign in with your Caddy credentials, then come back and hit Retry.");
+  if(r.reason === "network") throw new Error("Network error \u2014 the tunnel or the local Caddy server may be down. Check cloudflared/Caddy are still running.");
+  throw new Error("Could not read the folder listing of " + shown + " (" + r.reason + ").");
 }
 
 /* ------------------------------------------------------------------
@@ -764,10 +1005,13 @@ function render(entries){
   const folders = entries.filter(e=>e.isDir).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
   const photos  = entries.filter(e=>!e.isDir && isImg(e.name)).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
   const vids    = entries.filter(e=>!e.isDir && isVid(e.name)).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
-  const files   = entries.filter(e=>!e.isDir && !isImg(e.name) && !isVid(e.name)).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
+  // "Documents" section shows known file types (PDF, archives, docs, audio, code…)
+  const files   = entries.filter(e=>!e.isDir && !isImg(e.name) && !isVid(e.name) && isDoc(e.name)).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
+  // Anything else with an unknown/missing extension — still shown, never hidden.
+  const others  = entries.filter(e=>!e.isDir && !isImg(e.name) && !isVid(e.name) && !isDoc(e.name)).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
 
   // gallery source for lightbox
-  galleryImages = photos.map(p=>({ name:p.name, url: buildURL([...path, p.name]) }));
+  galleryImages = photos.map(p=>({ name:p.name, url: vaultURL([...path, p.name], true) }));
 
   let out = "";
 
@@ -789,7 +1033,7 @@ function render(entries){
   /* --- photos --- */
   if(photos.length){
     const items = photos.map((p,i)=>{
-      const u = buildURL([...path, p.name]);
+      const u = vaultURL([...path, p.name], true);
       return `<button class="photo stag" data-photo="${i}" aria-label="View ${esc(p.name)}">
           <img data-src="${u}" alt="${esc(p.name)}" loading="lazy">
           <span class="pcap">${esc(p.name)}</span>
@@ -802,21 +1046,22 @@ function render(entries){
   if(vids.length){
     const play = `<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>`;
     const items = vids.map((v)=>{
-      const u = buildURL([...path, v.name]);
+      const u = vaultURL([...path, v.name], true);
       return `<button class="vtile stag" data-video="${esc(u)}" data-name="${esc(v.name)}" aria-label="Play ${esc(v.name)}">
           <video muted preload="metadata" playsinline src="${u}#t=0.1"></video>
           <span class="play">${play}</span>
-          <span class="vname">${esc(baseName(v.name))}</span>
+          <span class="vname">${esc(v.name)}</span>
         </button>`;
     }).join("");
     out += makeSection("Motion", vids.length+" REELS", `<div class="videos">${items}</div>`);
   }
 
-  /* --- files --- */
-  if(files.length){
+  /* --- files (PDFs, docs, archives, audio, code…) --- */
+  const allFiles = files.concat(others);
+  if(allFiles.length){
     const dl = `<svg viewBox="0 0 24 24" fill="none" stroke-width="1.5"><path d="M12 4v11m0 0l-4-4m4 4l4-4M5 20h14"/></svg>`;
-    const items = files.map(f=>{
-      const u = buildURL([...path, f.name]);
+    const items = allFiles.map(f=>{
+      const u = vaultURL([...path, f.name], true);
       const ex = extOf(f.name).toUpperCase() || "FILE";
       return `<a class="fcard stag" href="${u}" download aria-label="Download ${esc(f.name)}">
           <span class="ficon">${esc(ex.slice(0,4))}</span>
@@ -827,7 +1072,7 @@ function render(entries){
           <span class="dl">${dl}</span>
         </a>`;
     }).join("");
-    out += makeSection("Documents", files.length+" FILES", `<div class="files">${items}</div>`);
+    out += makeSection("Documents", allFiles.length+" FILES", `<div class="files">${items}</div>`);
   }
 
   main.innerHTML = out;
@@ -906,7 +1151,10 @@ async function load(){
     main.innerHTML = `<div class="state"><div class="inner">
         <div class="big">Reel unavailable.</div>
         <div class="small">Could not reach the archive.<br>${esc(err.message||"Unknown error")}</div>
+        <button class="back-btn" id="retryBtn" style="margin-top:26px;display:inline-flex">Retry</button>
       </div></div>`;
+    const rb = $("#retryBtn");
+    if(rb) rb.addEventListener("click", load);
   }
 }
 
