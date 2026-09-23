@@ -12,7 +12,11 @@
     
     handle {
         root * "C:/Web Server"
+        # NOTE: no `try_files {path} /index.html` here — that SPA fallback served
+        # index.html for every missing file (404s became fake HTML 200s), so broken
+        # image/video/pdf links silently showed the page instead of the real file.
+        # Also: an index.html placed inside a folder shadows that folder's listing,
+        # so don't put index.html files inside folders you want browsed via /files/.
         file_server
-        try_files {path} /index.html
     }
 }
